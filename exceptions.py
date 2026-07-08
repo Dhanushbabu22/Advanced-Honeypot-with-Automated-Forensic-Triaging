@@ -1,971 +1,905 @@
-"""Exceptions used throughout package.
+"""Implements a number of Python exceptions which can be raised from within
+a view to trigger a standard HTTP non-200 response.
 
-This module MUST NOT try to import from anything within `pip._internal` to
-operate. This is expected to be importable from any/all files within the
-subpackage and, thus, should not depend on them.
+Usage Example
+-------------
+
+.. code-block:: python
+
+    from werkzeug.wrappers.request import Request
+    from werkzeug.exceptions import HTTPException, NotFound
+
+    def view(request):
+        raise NotFound()
+
+    @Request.application
+    def application(request):
+        try:
+            return view(request)
+        except HTTPException as e:
+            return e
+
+As you can see from this example those exceptions are callable WSGI
+applications. However, they are not Werkzeug response objects. You
+can get a response object by calling ``get_response()`` on a HTTP
+exception.
+
+Keep in mind that you may have to pass an environ (WSGI) or scope
+(ASGI) to ``get_response()`` because some errors fetch additional
+information relating to the request.
+
+If you want to hook in a different exception page to say, a 404 status
+code, you can add a second except for a specific subclass of an error:
+
+.. code-block:: python
+
+    @Request.application
+    def application(request):
+        try:
+            return view(request)
+        except NotFound as e:
+            return not_found(request)
+        except HTTPException as e:
+            return e
+
 """
 
 from __future__ import annotations
 
-import configparser
-import contextlib
-import locale
-import logging
-import pathlib
-import re
-import sys
-import traceback
-from collections.abc import Iterable, Iterator
-from itertools import chain, groupby, repeat
-from typing import TYPE_CHECKING, Literal
+import typing as t
+from datetime import datetime
 
-from pip._vendor.packaging.requirements import InvalidRequirement
-from pip._vendor.packaging.version import InvalidVersion
-from pip._vendor.rich.console import Console, ConsoleOptions, RenderResult
-from pip._vendor.rich.markup import escape
-from pip._vendor.rich.text import Text
+from markupsafe import escape
+from markupsafe import Markup
 
-if TYPE_CHECKING:
-    from hashlib import _Hash
+from ._internal import _get_environ
 
-    from pip._vendor.requests.models import PreparedRequest, Request, Response
+if t.TYPE_CHECKING:
+    from _typeshed.wsgi import StartResponse
+    from _typeshed.wsgi import WSGIEnvironment
 
-    from pip._internal.metadata import BaseDistribution
-    from pip._internal.models.link import Link
-    from pip._internal.network.download import _FileDownload
-    from pip._internal.req.req_install import InstallRequirement
-
-logger = logging.getLogger(__name__)
+    from .datastructures import WWWAuthenticate
+    from .sansio.response import Response as SansIOResponse
+    from .wrappers.request import Request as WSGIRequest
+    from .wrappers.response import Response as WSGIResponse
 
 
-#
-# Scaffolding
-#
-def _is_kebab_case(s: str) -> bool:
-    return re.match(r"^[a-z]+(-[a-z]+)*$", s) is not None
+class HTTPException(Exception):
+    """The base class for all HTTP exceptions. This exception can be called as a WSGI
+    application to render a default error page or you can catch the subclasses
+    of it independently and render nicer error messages.
 
-
-def _prefix_with_indent(
-    s: Text | str,
-    console: Console,
-    *,
-    prefix: str,
-    indent: str,
-) -> Text:
-    if isinstance(s, Text):
-        text = s
-    else:
-        text = console.render_str(s)
-
-    return console.render_str(prefix, overflow="ignore") + console.render_str(
-        f"\n{indent}", overflow="ignore"
-    ).join(text.split(allow_blank=True))
-
-
-class PipError(Exception):
-    """The base pip error."""
-
-
-class DiagnosticPipError(PipError):
-    """An error, that presents diagnostic information to the user.
-
-    This contains a bunch of logic, to enable pretty presentation of our error
-    messages. Each error gets a unique reference. Each error can also include
-    additional context, a hint and/or a note -- which are presented with the
-    main error message in a consistent style.
-
-    This is adapted from the error output styling in `sphinx-theme-builder`.
+    .. versionchanged:: 2.1
+        Removed the ``wrap`` class method.
     """
 
-    reference: str
+    code: int | None = None
+    description: str | None = None
 
     def __init__(
         self,
-        *,
-        kind: Literal["error", "warning"] = "error",
-        reference: str | None = None,
-        message: str | Text,
-        context: str | Text | None,
-        hint_stmt: str | Text | None,
-        note_stmt: str | Text | None = None,
-        link: str | None = None,
+        description: str | None = None,
+        response: SansIOResponse | None = None,
     ) -> None:
-        # Ensure a proper reference is provided.
-        if reference is None:
-            assert hasattr(self, "reference"), "error reference not provided!"
-            reference = self.reference
-        assert _is_kebab_case(reference), "error reference must be kebab-case!"
+        super().__init__()
+        if description is not None:
+            self.description = description
+        self.response = response
 
-        self.kind = kind
-        self.reference = reference
+    @property
+    def name(self) -> str:
+        """The status name."""
+        from .http import HTTP_STATUS_CODES
 
-        self.message = message
-        self.context = context
+        return HTTP_STATUS_CODES.get(self.code, "Unknown Error")  # type: ignore
 
-        self.note_stmt = note_stmt
-        self.hint_stmt = hint_stmt
+    def get_description(
+        self,
+        environ: WSGIEnvironment | None = None,
+        scope: dict[str, t.Any] | None = None,
+    ) -> str:
+        """Get the description."""
+        if self.description is None:
+            description = ""
+        else:
+            description = self.description
 
-        self.link = link
+        description = escape(description).replace("\n", Markup("<br>"))
+        return f"<p>{description}</p>"
 
-        super().__init__(f"<{self.__class__.__name__}: {self.reference}>")
+    def get_body(
+        self,
+        environ: WSGIEnvironment | None = None,
+        scope: dict[str, t.Any] | None = None,
+    ) -> str:
+        """Get the HTML body."""
+        return (
+            "<!doctype html>\n"
+            "<html lang=en>\n"
+            f"<title>{self.code} {escape(self.name)}</title>\n"
+            f"<h1>{escape(self.name)}</h1>\n"
+            f"{self.get_description(environ)}\n"
+        )
+
+    def get_headers(
+        self,
+        environ: WSGIEnvironment | None = None,
+        scope: dict[str, t.Any] | None = None,
+    ) -> list[tuple[str, str]]:
+        """Get a list of headers."""
+        return [("Content-Type", "text/html; charset=utf-8")]
+
+    @t.overload
+    def get_response(
+        self,
+        environ: WSGIEnvironment | WSGIRequest | None = ...,
+        scope: None = None,
+    ) -> WSGIResponse: ...
+    @t.overload
+    def get_response(
+        self,
+        environ: None = None,
+        scope: dict[str, t.Any] = ...,
+    ) -> SansIOResponse: ...
+    def get_response(
+        self,
+        environ: WSGIEnvironment | WSGIRequest | None = None,
+        scope: dict[str, t.Any] | None = None,
+    ) -> WSGIResponse | SansIOResponse:
+        """Get a response object.
+
+        :param environ: A WSGI environ dict or request object. If given, may be
+            used to customize the response based on the request.
+        :param scope: An ASGI scope dict. If given, may be used to customize the
+            response based on the request.
+        :return: A WSGI :class:`werkzeug.wrappers.Response` if called without
+            arguments or with ``environ``. A sans-IO
+            :class:`werkzeug.sansio.Response` for ASGI if called with
+            ``scope``.
+        """
+        from .wrappers.response import Response
+
+        if self.response is not None:
+            return self.response
+        if environ is not None:
+            environ = _get_environ(environ)
+        headers = self.get_headers(environ, scope)
+        return Response(self.get_body(environ, scope), self.code, headers)
+
+    def __call__(
+        self, environ: WSGIEnvironment, start_response: StartResponse
+    ) -> t.Iterable[bytes]:
+        """Call the exception as WSGI application.
+
+        :param environ: the WSGI environment.
+        :param start_response: the response callable provided by the WSGI
+                               server.
+        """
+        response = self.get_response(environ)
+        return response(environ, start_response)
+
+    def __str__(self) -> str:
+        code = self.code if self.code is not None else "???"
+        return f"{code} {self.name}: {self.description}"
 
     def __repr__(self) -> str:
-        return (
-            f"<{self.__class__.__name__}("
-            f"reference={self.reference!r}, "
-            f"message={self.message!r}, "
-            f"context={self.context!r}, "
-            f"note_stmt={self.note_stmt!r}, "
-            f"hint_stmt={self.hint_stmt!r}"
-            ")>"
-        )
+        code = self.code if self.code is not None else "???"
+        return f"<{type(self).__name__} '{code}: {self.name}'>"
 
-    def __rich_console__(
+
+class BadRequest(HTTPException):
+    """*400* `Bad Request`
+
+    Raise if the browser sends something to the application the application
+    or server cannot handle.
+    """
+
+    code = 400
+    description = (
+        "The browser (or proxy) sent a request that this server could not understand."
+    )
+
+
+class BadRequestKeyError(BadRequest, KeyError):
+    """An exception that is used to signal both a :exc:`KeyError` and a
+    :exc:`BadRequest`. Used by many of the datastructures.
+    """
+
+    _description = BadRequest.description
+    #: Show the KeyError along with the HTTP error message in the
+    #: response. This should be disabled in production, but can be
+    #: useful in a debug mode.
+    show_exception = False
+
+    def __init__(self, arg: object | None = None, *args: t.Any, **kwargs: t.Any):
+        super().__init__(*args, **kwargs)
+
+        if arg is None:
+            KeyError.__init__(self)
+        else:
+            KeyError.__init__(self, arg)
+
+    @property
+    def description(self) -> str:
+        if self.show_exception:
+            return f"{self._description}\n{KeyError.__name__}: {KeyError.__str__(self)}"
+
+        return self._description
+
+    @description.setter
+    def description(self, value: str) -> None:
+        self._description = value
+
+
+class ClientDisconnected(BadRequest):
+    """Internal exception that is raised if Werkzeug detects a disconnected
+    client.  Since the client is already gone at that point attempting to
+    send the error message to the client might not work and might ultimately
+    result in another exception in the server.  Mainly this is here so that
+    it is silenced by default as far as Werkzeug is concerned.
+
+    Since disconnections cannot be reliably detected and are unspecified
+    by WSGI to a large extent this might or might not be raised if a client
+    is gone.
+
+    .. versionadded:: 0.8
+    """
+
+
+class SecurityError(BadRequest):
+    """Raised if something triggers a security error.  This is otherwise
+    exactly like a bad request error.
+
+    .. versionadded:: 0.9
+    """
+
+
+class BadHost(BadRequest):
+    """Raised if the submitted host is badly formatted.
+
+    .. versionadded:: 0.11.2
+    """
+
+
+class Unauthorized(HTTPException):
+    """*401* ``Unauthorized``
+
+    Raise if the user is not authorized to access a resource.
+
+    The ``www_authenticate`` argument should be used to set the
+    ``WWW-Authenticate`` header. This is used for HTTP basic auth and
+    other schemes. Use :class:`~werkzeug.datastructures.WWWAuthenticate`
+    to create correctly formatted values. Strictly speaking a 401
+    response is invalid if it doesn't provide at least one value for
+    this header, although real clients typically don't care.
+
+    :param description: Override the default message used for the body
+        of the response.
+    :param www-authenticate: A single value, or list of values, for the
+        WWW-Authenticate header(s).
+
+    .. versionchanged:: 2.0
+        Serialize multiple ``www_authenticate`` items into multiple
+        ``WWW-Authenticate`` headers, rather than joining them
+        into a single value, for better interoperability.
+
+    .. versionchanged:: 0.15.3
+        If the ``www_authenticate`` argument is not set, the
+        ``WWW-Authenticate`` header is not set.
+
+    .. versionchanged:: 0.15.3
+        The ``response`` argument was restored.
+
+    .. versionchanged:: 0.15.1
+        ``description`` was moved back as the first argument, restoring
+         its previous position.
+
+    .. versionchanged:: 0.15.0
+        ``www_authenticate`` was added as the first argument, ahead of
+        ``description``.
+    """
+
+    code = 401
+    description = (
+        "The server could not verify that you are authorized to access"
+        " the URL requested. You either supplied the wrong credentials"
+        " (e.g. a bad password), or your browser doesn't understand"
+        " how to supply the credentials required."
+    )
+
+    def __init__(
         self,
-        console: Console,
-        options: ConsoleOptions,
-    ) -> RenderResult:
-        colour = "red" if self.kind == "error" else "yellow"
+        description: str | None = None,
+        response: SansIOResponse | None = None,
+        www_authenticate: None | (WWWAuthenticate | t.Iterable[WWWAuthenticate]) = None,
+    ) -> None:
+        super().__init__(description, response)
 
-        yield f"[{colour} bold]{self.kind}[/]: [bold]{self.reference}[/]"
-        yield ""
+        from .datastructures import WWWAuthenticate
 
-        if not options.ascii_only:
-            # Present the main message, with relevant context indented.
-            if self.context is not None:
-                yield _prefix_with_indent(
-                    self.message,
-                    console,
-                    prefix=f"[{colour}]×[/] ",
-                    indent=f"[{colour}]│[/] ",
-                )
-                yield _prefix_with_indent(
-                    self.context,
-                    console,
-                    prefix=f"[{colour}]╰─>[/] ",
-                    indent=f"[{colour}]   [/] ",
-                )
+        if isinstance(www_authenticate, WWWAuthenticate):
+            www_authenticate = (www_authenticate,)
+
+        self.www_authenticate = www_authenticate
+
+    def get_headers(
+        self,
+        environ: WSGIEnvironment | None = None,
+        scope: dict[str, t.Any] | None = None,
+    ) -> list[tuple[str, str]]:
+        headers = super().get_headers(environ, scope)
+        if self.www_authenticate:
+            headers.extend(("WWW-Authenticate", str(x)) for x in self.www_authenticate)
+        return headers
+
+
+class Forbidden(HTTPException):
+    """*403* `Forbidden`
+
+    Raise if the user doesn't have the permission for the requested resource
+    but was authenticated.
+    """
+
+    code = 403
+    description = (
+        "You don't have the permission to access the requested"
+        " resource. It is either read-protected or not readable by the"
+        " server."
+    )
+
+
+class NotFound(HTTPException):
+    """*404* `Not Found`
+
+    Raise if a resource does not exist and never existed.
+    """
+
+    code = 404
+    description = (
+        "The requested URL was not found on the server. If you entered"
+        " the URL manually please check your spelling and try again."
+    )
+
+
+class MethodNotAllowed(HTTPException):
+    """*405* `Method Not Allowed`
+
+    Raise if the server used a method the resource does not handle.  For
+    example `POST` if the resource is view only.  Especially useful for REST.
+
+    The first argument for this exception should be a list of allowed methods.
+    Strictly speaking the response would be invalid if you don't provide valid
+    methods in the header which you can do with that list.
+    """
+
+    code = 405
+    description = "The method is not allowed for the requested URL."
+
+    def __init__(
+        self,
+        valid_methods: t.Iterable[str] | None = None,
+        description: str | None = None,
+        response: SansIOResponse | None = None,
+    ) -> None:
+        """Takes an optional list of valid http methods
+        starting with werkzeug 0.3 the list will be mandatory."""
+        super().__init__(description=description, response=response)
+        self.valid_methods = valid_methods
+
+    def get_headers(
+        self,
+        environ: WSGIEnvironment | None = None,
+        scope: dict[str, t.Any] | None = None,
+    ) -> list[tuple[str, str]]:
+        headers = super().get_headers(environ, scope)
+        if self.valid_methods:
+            headers.append(("Allow", ", ".join(self.valid_methods)))
+        return headers
+
+
+class NotAcceptable(HTTPException):
+    """*406* `Not Acceptable`
+
+    Raise if the server can't return any content conforming to the
+    `Accept` headers of the client.
+    """
+
+    code = 406
+    description = (
+        "The resource identified by the request is only capable of"
+        " generating response entities which have content"
+        " characteristics not acceptable according to the accept"
+        " headers sent in the request."
+    )
+
+
+class RequestTimeout(HTTPException):
+    """*408* `Request Timeout`
+
+    Raise to signalize a timeout.
+    """
+
+    code = 408
+    description = (
+        "The server closed the network connection because the browser"
+        " didn't finish the request within the specified time."
+    )
+
+
+class Conflict(HTTPException):
+    """*409* `Conflict`
+
+    Raise to signal that a request cannot be completed because it conflicts
+    with the current state on the server.
+
+    .. versionadded:: 0.7
+    """
+
+    code = 409
+    description = (
+        "A conflict happened while processing the request. The"
+        " resource might have been modified while the request was being"
+        " processed."
+    )
+
+
+class Gone(HTTPException):
+    """*410* `Gone`
+
+    Raise if a resource existed previously and went away without new location.
+    """
+
+    code = 410
+    description = (
+        "The requested URL is no longer available on this server and"
+        " there is no forwarding address. If you followed a link from a"
+        " foreign page, please contact the author of this page."
+    )
+
+
+class LengthRequired(HTTPException):
+    """*411* `Length Required`
+
+    Raise if the browser submitted data but no ``Content-Length`` header which
+    is required for the kind of processing the server does.
+    """
+
+    code = 411
+    description = (
+        "A request with this method requires a valid <code>Content-"
+        "Length</code> header."
+    )
+
+
+class PreconditionFailed(HTTPException):
+    """*412* `Precondition Failed`
+
+    Status code used in combination with ``If-Match``, ``If-None-Match``, or
+    ``If-Unmodified-Since``.
+    """
+
+    code = 412
+    description = (
+        "The precondition on the request for the URL failed positive evaluation."
+    )
+
+
+class RequestEntityTooLarge(HTTPException):
+    """*413* `Request Entity Too Large`
+
+    The status code one should return if the data submitted exceeded a given
+    limit.
+    """
+
+    code = 413
+    description = "The data value transmitted exceeds the capacity limit."
+
+
+class RequestURITooLarge(HTTPException):
+    """*414* `Request URI Too Large`
+
+    Like *413* but for too long URLs.
+    """
+
+    code = 414
+    description = (
+        "The length of the requested URL exceeds the capacity limit for"
+        " this server. The request cannot be processed."
+    )
+
+
+class UnsupportedMediaType(HTTPException):
+    """*415* `Unsupported Media Type`
+
+    The status code returned if the server is unable to handle the media type
+    the client transmitted.
+    """
+
+    code = 415
+    description = (
+        "The server does not support the media type transmitted in the request."
+    )
+
+
+class RequestedRangeNotSatisfiable(HTTPException):
+    """*416* `Requested Range Not Satisfiable`
+
+    The client asked for an invalid part of the file.
+
+    .. versionadded:: 0.7
+    """
+
+    code = 416
+    description = "The server cannot provide the requested range."
+
+    def __init__(
+        self,
+        length: int | None = None,
+        units: str = "bytes",
+        description: str | None = None,
+        response: SansIOResponse | None = None,
+    ) -> None:
+        """Takes an optional `Content-Range` header value based on ``length``
+        parameter.
+        """
+        super().__init__(description=description, response=response)
+        self.length = length
+        self.units = units
+
+    def get_headers(
+        self,
+        environ: WSGIEnvironment | None = None,
+        scope: dict[str, t.Any] | None = None,
+    ) -> list[tuple[str, str]]:
+        headers = super().get_headers(environ, scope)
+        if self.length is not None:
+            headers.append(("Content-Range", f"{self.units} */{self.length}"))
+        return headers
+
+
+class ExpectationFailed(HTTPException):
+    """*417* `Expectation Failed`
+
+    The server cannot meet the requirements of the Expect request-header.
+
+    .. versionadded:: 0.7
+    """
+
+    code = 417
+    description = "The server could not meet the requirements of the Expect header"
+
+
+class ImATeapot(HTTPException):
+    """*418* `I'm a teapot`
+
+    The server should return this if it is a teapot and someone attempted
+    to brew coffee with it.
+
+    .. versionadded:: 0.7
+    """
+
+    code = 418
+    description = "This server is a teapot, not a coffee machine"
+
+
+class MisdirectedRequest(HTTPException):
+    """421 Misdirected Request
+
+    Indicates that the request was directed to a server that is not able to
+    produce a response.
+
+    .. versionadded:: 3.1
+    """
+
+    code = 421
+    description = "The server is not able to produce a response."
+
+
+class UnprocessableEntity(HTTPException):
+    """*422* `Unprocessable Entity`
+
+    Used if the request is well formed, but the instructions are otherwise
+    incorrect.
+    """
+
+    code = 422
+    description = (
+        "The request was well-formed but was unable to be followed due"
+        " to semantic errors."
+    )
+
+
+class Locked(HTTPException):
+    """*423* `Locked`
+
+    Used if the resource that is being accessed is locked.
+    """
+
+    code = 423
+    description = "The resource that is being accessed is locked."
+
+
+class FailedDependency(HTTPException):
+    """*424* `Failed Dependency`
+
+    Used if the method could not be performed on the resource
+    because the requested action depended on another action and that action failed.
+    """
+
+    code = 424
+    description = (
+        "The method could not be performed on the resource because the"
+        " requested action depended on another action and that action"
+        " failed."
+    )
+
+
+class PreconditionRequired(HTTPException):
+    """*428* `Precondition Required`
+
+    The server requires this request to be conditional, typically to prevent
+    the lost update problem, which is a race condition between two or more
+    clients attempting to update a resource through PUT or DELETE. By requiring
+    each client to include a conditional header ("If-Match" or "If-Unmodified-
+    Since") with the proper value retained from a recent GET request, the
+    server ensures that each client has at least seen the previous revision of
+    the resource.
+    """
+
+    code = 428
+    description = (
+        "This request is required to be conditional; try using"
+        ' "If-Match" or "If-Unmodified-Since".'
+    )
+
+
+class _RetryAfter(HTTPException):
+    """Adds an optional ``retry_after`` parameter which will set the
+    ``Retry-After`` header. May be an :class:`int` number of seconds or
+    a :class:`~datetime.datetime`.
+    """
+
+    def __init__(
+        self,
+        description: str | None = None,
+        response: SansIOResponse | None = None,
+        retry_after: datetime | int | None = None,
+    ) -> None:
+        super().__init__(description, response)
+        self.retry_after = retry_after
+
+    def get_headers(
+        self,
+        environ: WSGIEnvironment | None = None,
+        scope: dict[str, t.Any] | None = None,
+    ) -> list[tuple[str, str]]:
+        headers = super().get_headers(environ, scope)
+
+        if self.retry_after:
+            if isinstance(self.retry_after, datetime):
+                from .http import http_date
+
+                value = http_date(self.retry_after)
             else:
-                yield _prefix_with_indent(
-                    self.message,
-                    console,
-                    prefix="[red]×[/] ",
-                    indent="  ",
-                )
-        else:
-            yield self.message
-            if self.context is not None:
-                yield ""
-                yield self.context
+                value = str(self.retry_after)
 
-        if self.note_stmt is not None or self.hint_stmt is not None:
-            yield ""
+            headers.append(("Retry-After", value))
 
-        if self.note_stmt is not None:
-            yield _prefix_with_indent(
-                self.note_stmt,
-                console,
-                prefix="[magenta bold]note[/]: ",
-                indent="      ",
-            )
-        if self.hint_stmt is not None:
-            yield _prefix_with_indent(
-                self.hint_stmt,
-                console,
-                prefix="[cyan bold]hint[/]: ",
-                indent="      ",
-            )
-
-        if self.link is not None:
-            yield ""
-            yield f"Link: {self.link}"
+        return headers
 
 
-#
-# Actual Errors
-#
-class ConfigurationError(PipError):
-    """General exception in configuration"""
+class TooManyRequests(_RetryAfter):
+    """*429* `Too Many Requests`
 
+    The server is limiting the rate at which this user receives
+    responses, and this request exceeds that rate. (The server may use
+    any convenient method to identify users and their request rates).
+    The server may include a "Retry-After" header to indicate how long
+    the user should wait before retrying.
 
-class InstallationError(PipError):
-    """General exception during installation"""
+    :param retry_after: If given, set the ``Retry-After`` header to this
+        value. May be an :class:`int` number of seconds or a
+        :class:`~datetime.datetime`.
 
-
-class FailedToPrepareCandidate(InstallationError):
-    """Raised when we fail to prepare a candidate (i.e. fetch and generate metadata).
-
-    This is intentionally not a diagnostic error, since the output will be presented
-    above this error, when this occurs. This should instead present information to the
-    user.
+    .. versionchanged:: 1.0
+        Added ``retry_after`` parameter.
     """
 
-    def __init__(
-        self, *, package_name: str, requirement_chain: str, failed_step: str
-    ) -> None:
-        super().__init__(f"Failed to build '{package_name}' when {failed_step.lower()}")
-        self.package_name = package_name
-        self.requirement_chain = requirement_chain
-        self.failed_step = failed_step
+    code = 429
+    description = "This user has exceeded an allotted request count. Try again later."
 
 
-class MissingPyProjectBuildRequires(DiagnosticPipError):
-    """Raised when pyproject.toml has `build-system`, but no `build-system.requires`."""
+class RequestHeaderFieldsTooLarge(HTTPException):
+    """*431* `Request Header Fields Too Large`
 
-    reference = "missing-pyproject-build-system-requires"
-
-    def __init__(self, *, package: str) -> None:
-        super().__init__(
-            message=f"Can not process {escape(package)}",
-            context=Text(
-                "This package has an invalid pyproject.toml file.\n"
-                "The [build-system] table is missing the mandatory `requires` key."
-            ),
-            note_stmt="This is an issue with the package mentioned above, not pip.",
-            hint_stmt=Text("See PEP 518 for the detailed specification."),
-        )
-
-
-class InvalidPyProjectBuildRequires(DiagnosticPipError):
-    """Raised when pyproject.toml an invalid `build-system.requires`."""
-
-    reference = "invalid-pyproject-build-system-requires"
-
-    def __init__(self, *, package: str, reason: str) -> None:
-        super().__init__(
-            message=f"Can not process {escape(package)}",
-            context=Text(
-                "This package has an invalid `build-system.requires` key in "
-                f"pyproject.toml.\n{reason}"
-            ),
-            note_stmt="This is an issue with the package mentioned above, not pip.",
-            hint_stmt=Text("See PEP 518 for the detailed specification."),
-        )
-
-
-class NoneMetadataError(PipError):
-    """Raised when accessing a Distribution's "METADATA" or "PKG-INFO".
-
-    This signifies an inconsistency, when the Distribution claims to have
-    the metadata file (if not, raise ``FileNotFoundError`` instead), but is
-    not actually able to produce its content. This may be due to permission
-    errors.
+    The server refuses to process the request because the header fields are too
+    large. One or more individual fields may be too large, or the set of all
+    headers is too large.
     """
+
+    code = 431
+    description = "One or more header fields exceeds the maximum size."
+
+
+class UnavailableForLegalReasons(HTTPException):
+    """*451* `Unavailable For Legal Reasons`
+
+    This status code indicates that the server is denying access to the
+    resource as a consequence of a legal demand.
+    """
+
+    code = 451
+    description = "Unavailable for legal reasons."
+
+
+class InternalServerError(HTTPException):
+    """*500* `Internal Server Error`
+
+    Raise if an internal server error occurred.  This is a good fallback if an
+    unknown error occurred in the dispatcher.
+
+    .. versionchanged:: 1.0.0
+        Added the :attr:`original_exception` attribute.
+    """
+
+    code = 500
+    description = (
+        "The server encountered an internal error and was unable to"
+        " complete your request. Either the server is overloaded or"
+        " there is an error in the application."
+    )
 
     def __init__(
         self,
-        dist: BaseDistribution,
-        metadata_name: str,
+        description: str | None = None,
+        response: SansIOResponse | None = None,
+        original_exception: BaseException | None = None,
     ) -> None:
-        """
-        :param dist: A Distribution object.
-        :param metadata_name: The name of the metadata being accessed
-            (can be "METADATA" or "PKG-INFO").
-        """
-        self.dist = dist
-        self.metadata_name = metadata_name
-
-    def __str__(self) -> str:
-        # Use `dist` in the error message because its stringification
-        # includes more information, like the version and location.
-        return f"None {self.metadata_name} metadata found for distribution: {self.dist}"
+        #: The original exception that caused this 500 error. Can be
+        #: used by frameworks to provide context when handling
+        #: unexpected errors.
+        self.original_exception = original_exception
+        super().__init__(description=description, response=response)
 
 
-class UserInstallationInvalid(InstallationError):
-    """A --user install is requested on an environment without user site."""
+class NotImplemented(HTTPException):
+    """*501* `Not Implemented`
 
-    def __str__(self) -> str:
-        return "User base directory is not specified"
-
-
-class InvalidSchemeCombination(InstallationError):
-    def __str__(self) -> str:
-        before = ", ".join(str(a) for a in self.args[:-1])
-        return f"Cannot set {before} and {self.args[-1]} together"
-
-
-class DistributionNotFound(InstallationError):
-    """Raised when a distribution cannot be found to satisfy a requirement"""
-
-
-class RequirementsFileParseError(InstallationError):
-    """Raised when a general error occurs parsing a requirements file line."""
-
-
-class BestVersionAlreadyInstalled(PipError):
-    """Raised when the most up-to-date version of a package is already
-    installed."""
-
-
-class BadCommand(PipError):
-    """Raised when virtualenv or a command is not found"""
-
-
-class CommandError(PipError):
-    """Raised when there is an error in command-line arguments"""
-
-
-class PreviousBuildDirError(PipError):
-    """Raised when there's a previous conflicting build directory"""
-
-
-class NetworkConnectionError(PipError):
-    """HTTP connection error"""
-
-    def __init__(
-        self,
-        error_msg: str,
-        response: Response | None = None,
-        request: Request | PreparedRequest | None = None,
-    ) -> None:
-        """
-        Initialize NetworkConnectionError with  `request` and `response`
-        objects.
-        """
-        self.response = response
-        self.request = request
-        self.error_msg = error_msg
-        if (
-            self.response is not None
-            and not self.request
-            and hasattr(response, "request")
-        ):
-            self.request = self.response.request
-        super().__init__(error_msg, response, request)
-
-    def __str__(self) -> str:
-        return str(self.error_msg)
-
-
-class InvalidWheelFilename(InstallationError):
-    """Invalid wheel filename."""
-
-
-class UnsupportedWheel(InstallationError):
-    """Unsupported wheel."""
-
-
-class InvalidWheel(InstallationError):
-    """Invalid (e.g. corrupt) wheel."""
-
-    def __init__(self, location: str, name: str):
-        self.location = location
-        self.name = name
-
-    def __str__(self) -> str:
-        return f"Wheel '{self.name}' located at {self.location} is invalid."
-
-
-class MetadataInconsistent(InstallationError):
-    """Built metadata contains inconsistent information.
-
-    This is raised when the metadata contains values (e.g. name and version)
-    that do not match the information previously obtained from sdist filename,
-    user-supplied ``#egg=`` value, or an install requirement name.
+    Raise if the application does not support the action requested by the
+    browser.
     """
 
-    def __init__(
-        self, ireq: InstallRequirement, field: str, f_val: str, m_val: str
-    ) -> None:
-        self.ireq = ireq
-        self.field = field
-        self.f_val = f_val
-        self.m_val = m_val
-
-    def __str__(self) -> str:
-        return (
-            f"Requested {self.ireq} has inconsistent {self.field}: "
-            f"expected {self.f_val!r}, but metadata has {self.m_val!r}"
-        )
+    code = 501
+    description = "The server does not support the action requested by the browser."
 
 
-class MetadataInvalid(InstallationError):
-    """Metadata is invalid."""
+class BadGateway(HTTPException):
+    """*502* `Bad Gateway`
 
-    def __init__(self, ireq: InstallRequirement, error: str) -> None:
-        self.ireq = ireq
-        self.error = error
-
-    def __str__(self) -> str:
-        return f"Requested {self.ireq} has invalid metadata: {self.error}"
-
-
-class InstallationSubprocessError(DiagnosticPipError, InstallationError):
-    """A subprocess call failed."""
-
-    reference = "subprocess-exited-with-error"
-
-    def __init__(
-        self,
-        *,
-        command_description: str,
-        exit_code: int,
-        output_lines: list[str] | None,
-    ) -> None:
-        if output_lines is None:
-            output_prompt = Text("No available output.")
-        else:
-            output_prompt = (
-                Text.from_markup(f"[red][{len(output_lines)} lines of output][/]\n")
-                + Text("".join(output_lines))
-                + Text.from_markup(R"[red]\[end of output][/]")
-            )
-
-        super().__init__(
-            message=(
-                f"[green]{escape(command_description)}[/] did not run successfully.\n"
-                f"exit code: {exit_code}"
-            ),
-            context=output_prompt,
-            hint_stmt=None,
-            note_stmt=(
-                "This error originates from a subprocess, and is likely not a "
-                "problem with pip."
-            ),
-        )
-
-        self.command_description = command_description
-        self.exit_code = exit_code
-
-    def __str__(self) -> str:
-        return f"{self.command_description} exited with {self.exit_code}"
-
-
-class MetadataGenerationFailed(DiagnosticPipError, InstallationError):
-    reference = "metadata-generation-failed"
-
-    def __init__(
-        self,
-        *,
-        package_details: str,
-    ) -> None:
-        super().__init__(
-            message="Encountered error while generating package metadata.",
-            context=escape(package_details),
-            hint_stmt="See above for details.",
-            note_stmt="This is an issue with the package mentioned above, not pip.",
-        )
-
-    def __str__(self) -> str:
-        return "metadata generation failed"
-
-
-class HashErrors(InstallationError):
-    """Multiple HashError instances rolled into one for reporting"""
-
-    def __init__(self) -> None:
-        self.errors: list[HashError] = []
-
-    def append(self, error: HashError) -> None:
-        self.errors.append(error)
-
-    def __str__(self) -> str:
-        lines = []
-        self.errors.sort(key=lambda e: e.order)
-        for cls, errors_of_cls in groupby(self.errors, lambda e: e.__class__):
-            lines.append(cls.head)
-            lines.extend(e.body() for e in errors_of_cls)
-        if lines:
-            return "\n".join(lines)
-        return ""
-
-    def __bool__(self) -> bool:
-        return bool(self.errors)
-
-
-class HashError(InstallationError):
-    """
-    A failure to verify a package against known-good hashes
-
-    :cvar order: An int sorting hash exception classes by difficulty of
-        recovery (lower being harder), so the user doesn't bother fretting
-        about unpinned packages when he has deeper issues, like VCS
-        dependencies, to deal with. Also keeps error reports in a
-        deterministic order.
-    :cvar head: A section heading for display above potentially many
-        exceptions of this kind
-    :ivar req: The InstallRequirement that triggered this error. This is
-        pasted on after the exception is instantiated, because it's not
-        typically available earlier.
-
+    If you do proxying in your application you should return this status code
+    if you received an invalid response from the upstream server it accessed
+    in attempting to fulfill the request.
     """
 
-    req: InstallRequirement | None = None
-    head = ""
-    order: int = -1
-
-    def body(self) -> str:
-        """Return a summary of me for display under the heading.
-
-        This default implementation simply prints a description of the
-        triggering requirement.
-
-        :param req: The InstallRequirement that provoked this error, with
-            its link already populated by the resolver's _populate_link().
-
-        """
-        return f"    {self._requirement_name()}"
-
-    def __str__(self) -> str:
-        return f"{self.head}\n{self.body()}"
-
-    def _requirement_name(self) -> str:
-        """Return a description of the requirement that triggered me.
-
-        This default implementation returns long description of the req, with
-        line numbers
-
-        """
-        return str(self.req) if self.req else "unknown package"
-
-
-class VcsHashUnsupported(HashError):
-    """A hash was provided for a version-control-system-based requirement, but
-    we don't have a method for hashing those."""
-
-    order = 0
-    head = (
-        "Can't verify hashes for these requirements because we don't "
-        "have a way to hash version control repositories:"
+    code = 502
+    description = (
+        "The proxy server received an invalid response from an upstream server."
     )
 
 
-class DirectoryUrlHashUnsupported(HashError):
-    """A hash was provided for a version-control-system-based requirement, but
-    we don't have a method for hashing those."""
+class ServiceUnavailable(_RetryAfter):
+    """*503* `Service Unavailable`
 
-    order = 1
-    head = (
-        "Can't verify hashes for these file:// requirements because they "
-        "point to directories:"
-    )
+    Status code you should return if a service is temporarily
+    unavailable.
 
+    :param retry_after: If given, set the ``Retry-After`` header to this
+        value. May be an :class:`int` number of seconds or a
+        :class:`~datetime.datetime`.
 
-class HashMissing(HashError):
-    """A hash was needed for a requirement but is absent."""
-
-    order = 2
-    head = (
-        "Hashes are required in --require-hashes mode, but they are "
-        "missing from some requirements. Here is a list of those "
-        "requirements along with the hashes their downloaded archives "
-        "actually had. Add lines like these to your requirements files to "
-        "prevent tampering. (If you did not enable --require-hashes "
-        "manually, note that it turns on automatically when any package "
-        "has a hash.)"
-    )
-
-    def __init__(self, gotten_hash: str) -> None:
-        """
-        :param gotten_hash: The hash of the (possibly malicious) archive we
-            just downloaded
-        """
-        self.gotten_hash = gotten_hash
-
-    def body(self) -> str:
-        # Dodge circular import.
-        from pip._internal.utils.hashes import FAVORITE_HASH
-
-        package = None
-        if self.req:
-            # In the case of URL-based requirements, display the original URL
-            # seen in the requirements file rather than the package name,
-            # so the output can be directly copied into the requirements file.
-            package = (
-                self.req.original_link
-                if self.req.is_direct
-                # In case someone feeds something downright stupid
-                # to InstallRequirement's constructor.
-                else getattr(self.req, "req", None)
-            )
-        return "    {} --hash={}:{}".format(
-            package or "unknown package", FAVORITE_HASH, self.gotten_hash
-        )
-
-
-class HashUnpinned(HashError):
-    """A requirement had a hash specified but was not pinned to a specific
-    version."""
-
-    order = 3
-    head = (
-        "In --require-hashes mode, all requirements must have their "
-        "versions pinned with ==. These do not:"
-    )
-
-
-class HashMismatch(HashError):
-    """
-    Distribution file hash values don't match.
-
-    :ivar package_name: The name of the package that triggered the hash
-        mismatch. Feel free to write to this after the exception is raise to
-        improve its error message.
-
+    .. versionchanged:: 1.0
+        Added ``retry_after`` parameter.
     """
 
-    order = 4
-    head = (
-        "THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS "
-        "FILE. If you have updated the package versions, please update "
-        "the hashes. Otherwise, examine the package contents carefully; "
-        "someone may have tampered with them."
+    code = 503
+    description = (
+        "The server is temporarily unable to service your request due"
+        " to maintenance downtime or capacity problems. Please try"
+        " again later."
     )
 
-    def __init__(self, allowed: dict[str, list[str]], gots: dict[str, _Hash]) -> None:
-        """
-        :param allowed: A dict of algorithm names pointing to lists of allowed
-            hex digests
-        :param gots: A dict of algorithm names pointing to hashes we
-            actually got from the files under suspicion
-        """
-        self.allowed = allowed
-        self.gots = gots
 
-    def body(self) -> str:
-        return f"    {self._requirement_name()}:\n{self._hash_comparison()}"
+class GatewayTimeout(HTTPException):
+    """*504* `Gateway Timeout`
 
-    def _hash_comparison(self) -> str:
-        """
-        Return a comparison of actual and expected hash values.
-
-        Example::
-
-               Expected sha256 abcdeabcdeabcdeabcdeabcdeabcdeabcdeabcdeabcde
-                            or 123451234512345123451234512345123451234512345
-                    Got        bcdefbcdefbcdefbcdefbcdefbcdefbcdefbcdefbcdef
-
-        """
-
-        def hash_then_or(hash_name: str) -> chain[str]:
-            # For now, all the decent hashes have 6-char names, so we can get
-            # away with hard-coding space literals.
-            return chain([hash_name], repeat("    or"))
-
-        lines: list[str] = []
-        for hash_name, expecteds in self.allowed.items():
-            prefix = hash_then_or(hash_name)
-            lines.extend((f"        Expected {next(prefix)} {e}") for e in expecteds)
-            lines.append(
-                f"             Got        {self.gots[hash_name].hexdigest()}\n"
-            )
-        return "\n".join(lines)
-
-
-class UnsupportedPythonVersion(InstallationError):
-    """Unsupported python version according to Requires-Python package
-    metadata."""
-
-
-class ConfigurationFileCouldNotBeLoaded(ConfigurationError):
-    """When there are errors while loading a configuration file"""
-
-    def __init__(
-        self,
-        reason: str = "could not be loaded",
-        fname: str | None = None,
-        error: configparser.Error | None = None,
-    ) -> None:
-        super().__init__(error)
-        self.reason = reason
-        self.fname = fname
-        self.error = error
-
-    def __str__(self) -> str:
-        if self.fname is not None:
-            message_part = f" in {self.fname}."
-        else:
-            assert self.error is not None
-            message_part = f".\n{self.error}\n"
-        return f"Configuration file {self.reason}{message_part}"
-
-
-_DEFAULT_EXTERNALLY_MANAGED_ERROR = f"""\
-The Python environment under {sys.prefix} is managed externally, and may not be
-manipulated by the user. Please use specific tooling from the distributor of
-the Python installation to interact with this environment instead.
-"""
-
-
-class ExternallyManagedEnvironment(DiagnosticPipError):
-    """The current environment is externally managed.
-
-    This is raised when the current environment is externally managed, as
-    defined by `PEP 668`_. The ``EXTERNALLY-MANAGED`` configuration is checked
-    and displayed when the error is bubbled up to the user.
-
-    :param error: The error message read from ``EXTERNALLY-MANAGED``.
+    Status code you should return if a connection to an upstream server
+    times out.
     """
 
-    reference = "externally-managed-environment"
+    code = 504
+    description = "The connection to an upstream server timed out."
 
-    def __init__(self, error: str | None) -> None:
-        if error is None:
-            context = Text(_DEFAULT_EXTERNALLY_MANAGED_ERROR)
-        else:
-            context = Text(error)
-        super().__init__(
-            message="This environment is externally managed",
-            context=context,
-            note_stmt=(
-                "If you believe this is a mistake, please contact your "
-                "Python installation or OS distribution provider. "
-                "You can override this, at the risk of breaking your Python "
-                "installation or OS, by passing --break-system-packages."
-            ),
-            hint_stmt=Text("See PEP 668 for the detailed specification."),
-        )
 
-    @staticmethod
-    def _iter_externally_managed_error_keys() -> Iterator[str]:
-        # LC_MESSAGES is in POSIX, but not the C standard. The most common
-        # platform that does not implement this category is Windows, where
-        # using other categories for console message localization is equally
-        # unreliable, so we fall back to the locale-less vendor message. This
-        # can always be re-evaluated when a vendor proposes a new alternative.
+class HTTPVersionNotSupported(HTTPException):
+    """*505* `HTTP Version Not Supported`
+
+    The server does not support the HTTP protocol version used in the request.
+    """
+
+    code = 505
+    description = (
+        "The server does not support the HTTP protocol version used in the request."
+    )
+
+
+default_exceptions: dict[int, type[HTTPException]] = {}
+
+
+def _find_exceptions() -> None:
+    for obj in globals().values():
         try:
-            category = locale.LC_MESSAGES
-        except AttributeError:
-            lang: str | None = None
-        else:
-            lang, _ = locale.getlocale(category)
-        if lang is not None:
-            yield f"Error-{lang}"
-            for sep in ("-", "_"):
-                before, found, _ = lang.partition(sep)
-                if not found:
-                    continue
-                yield f"Error-{before}"
-        yield "Error"
-
-    @classmethod
-    def from_config(
-        cls,
-        config: pathlib.Path | str,
-    ) -> ExternallyManagedEnvironment:
-        parser = configparser.ConfigParser(interpolation=None)
-        try:
-            parser.read(config, encoding="utf-8")
-            section = parser["externally-managed"]
-            for key in cls._iter_externally_managed_error_keys():
-                with contextlib.suppress(KeyError):
-                    return cls(section[key])
-        except KeyError:
-            pass
-        except (OSError, UnicodeDecodeError, configparser.ParsingError):
-            from pip._internal.utils._log import VERBOSE
-
-            exc_info = logger.isEnabledFor(VERBOSE)
-            logger.warning("Failed to read %s", config, exc_info=exc_info)
-        return cls(None)
+            is_http_exception = issubclass(obj, HTTPException)
+        except TypeError:
+            is_http_exception = False
+        if not is_http_exception or obj.code is None:
+            continue
+        old_obj = default_exceptions.get(obj.code, None)
+        if old_obj is not None and issubclass(obj, old_obj):
+            continue
+        default_exceptions[obj.code] = obj
 
 
-class UninstallMissingRecord(DiagnosticPipError):
-    reference = "uninstall-no-record-file"
-
-    def __init__(self, *, distribution: BaseDistribution) -> None:
-        installer = distribution.installer
-        if not installer or installer == "pip":
-            dep = f"{distribution.raw_name}=={distribution.version}"
-            hint = Text.assemble(
-                "You might be able to recover from this via: ",
-                (f"pip install --ignore-installed --no-deps {dep}", "green"),
-            )
-        else:
-            hint = Text(
-                f"The package was installed by {installer}. "
-                "You should check if it can uninstall the package."
-            )
-
-        super().__init__(
-            message=Text(f"Cannot uninstall {distribution}"),
-            context=(
-                "The package's contents are unknown: "
-                f"no RECORD file was found for {distribution.raw_name}."
-            ),
-            hint_stmt=hint,
-        )
+_find_exceptions()
+del _find_exceptions
 
 
-class LegacyDistutilsInstall(DiagnosticPipError):
-    reference = "uninstall-distutils-installed-package"
+class Aborter:
+    """When passed a dict of code -> exception items it can be used as
+    callable that raises exceptions.  If the first argument to the
+    callable is an integer it will be looked up in the mapping, if it's
+    a WSGI application it will be raised in a proxy exception.
 
-    def __init__(self, *, distribution: BaseDistribution) -> None:
-        super().__init__(
-            message=Text(f"Cannot uninstall {distribution}"),
-            context=(
-                "It is a distutils installed project and thus we cannot accurately "
-                "determine which files belong to it which would lead to only a partial "
-                "uninstall."
-            ),
-            hint_stmt=None,
-        )
-
-
-class InvalidInstalledPackage(DiagnosticPipError):
-    reference = "invalid-installed-package"
+    The rest of the arguments are forwarded to the exception constructor.
+    """
 
     def __init__(
         self,
-        *,
-        dist: BaseDistribution,
-        invalid_exc: InvalidRequirement | InvalidVersion,
+        mapping: dict[int, type[HTTPException]] | None = None,
+        extra: dict[int, type[HTTPException]] | None = None,
     ) -> None:
-        installed_location = dist.installed_location
+        if mapping is None:
+            mapping = default_exceptions
+        self.mapping = dict(mapping)
+        if extra is not None:
+            self.mapping.update(extra)
 
-        if isinstance(invalid_exc, InvalidRequirement):
-            invalid_type = "requirement"
-        else:
-            invalid_type = "version"
+    def __call__(
+        self, code: int | SansIOResponse, *args: t.Any, **kwargs: t.Any
+    ) -> t.NoReturn:
+        from .sansio.response import Response
 
-        super().__init__(
-            message=Text(
-                f"Cannot process installed package {dist} "
-                + (f"in {installed_location!r} " if installed_location else "")
-                + f"because it has an invalid {invalid_type}:\n{invalid_exc.args[0]}"
-            ),
-            context=(
-                "Starting with pip 24.1, packages with invalid "
-                f"{invalid_type}s can not be processed."
-            ),
-            hint_stmt="To proceed this package must be uninstalled.",
-        )
+        if isinstance(code, Response):
+            raise HTTPException(response=code)
 
+        if code not in self.mapping:
+            raise LookupError(f"no exception for {code!r}")
 
-class IncompleteDownloadError(DiagnosticPipError):
-    """Raised when the downloader receives fewer bytes than advertised
-    in the Content-Length header."""
-
-    reference = "incomplete-download"
-
-    def __init__(self, download: _FileDownload) -> None:
-        # Dodge circular import.
-        from pip._internal.utils.misc import format_size
-
-        assert download.size is not None
-        download_status = (
-            f"{format_size(download.bytes_received)}/{format_size(download.size)}"
-        )
-        if download.reattempts:
-            retry_status = f"after {download.reattempts + 1} attempts "
-            hint = "Use --resume-retries to configure resume attempt limit."
-        else:
-            # Download retrying is not enabled.
-            retry_status = ""
-            hint = "Consider using --resume-retries to enable download resumption."
-        message = Text(
-            f"Download failed {retry_status}because not enough bytes "
-            f"were received ({download_status})"
-        )
-
-        super().__init__(
-            message=message,
-            context=f"URL: {download.link.redacted_url}",
-            hint_stmt=hint,
-            note_stmt="This is an issue with network connectivity, not pip.",
-        )
+        raise self.mapping[code](*args, **kwargs)
 
 
-class ResolutionTooDeepError(DiagnosticPipError):
-    """Raised when the dependency resolver exceeds the maximum recursion depth."""
+def abort(status: int | SansIOResponse, *args: t.Any, **kwargs: t.Any) -> t.NoReturn:
+    """Raises an :py:exc:`HTTPException` for the given status code or WSGI
+    application.
 
-    reference = "resolution-too-deep"
+    If a status code is given, it will be looked up in the list of
+    exceptions and will raise that exception.  If passed a WSGI application,
+    it will wrap it in a proxy WSGI exception and raise that::
 
-    def __init__(self) -> None:
-        super().__init__(
-            message="Dependency resolution exceeded maximum depth",
-            context=(
-                "Pip cannot resolve the current dependencies as the dependency graph "
-                "is too complex for pip to solve efficiently."
-            ),
-            hint_stmt=(
-                "Try adding lower bounds to constrain your dependencies, "
-                "for example: 'package>=2.0.0' instead of just 'package'. "
-            ),
-            link="https://pip.pypa.io/en/stable/topics/dependency-resolution/#handling-resolution-too-deep-errors",
-        )
+       abort(404)  # 404 Not Found
+       abort(Response('Hello World'))
+
+    """
+    _aborter(status, *args, **kwargs)
 
 
-class InstallWheelBuildError(DiagnosticPipError):
-    reference = "failed-wheel-build-for-install"
-
-    def __init__(self, failed: list[InstallRequirement]) -> None:
-        super().__init__(
-            message=(
-                "Failed to build installable wheels for some "
-                "pyproject.toml based projects"
-            ),
-            context=", ".join(r.name for r in failed),  # type: ignore
-            hint_stmt=None,
-        )
-
-
-class InvalidEggFragment(DiagnosticPipError):
-    reference = "invalid-egg-fragment"
-
-    def __init__(self, link: Link, fragment: str) -> None:
-        hint = ""
-        if ">" in fragment or "=" in fragment or "<" in fragment:
-            hint = (
-                "Version specifiers are silently ignored for URL references. "
-                "Remove them. "
-            )
-        if "[" in fragment and "]" in fragment:
-            hint += "Try using the Direct URL requirement syntax: 'name[extra] @ URL'"
-
-        if not hint:
-            hint = "Egg fragments can only be a valid project name."
-
-        super().__init__(
-            message=f"The '{escape(fragment)}' egg fragment is invalid",
-            context=f"from '{escape(str(link))}'",
-            hint_stmt=escape(hint),
-        )
-
-
-class BuildDependencyInstallError(DiagnosticPipError):
-    """Raised when build dependencies cannot be installed."""
-
-    reference = "failed-build-dependency-install"
-
-    def __init__(
-        self,
-        req: InstallRequirement | None,
-        build_reqs: Iterable[str],
-        *,
-        cause: Exception,
-        log_lines: list[str] | None,
-    ) -> None:
-        if isinstance(cause, PipError):
-            note = "This is likely not a problem with pip."
-        else:
-            note = (
-                "pip crashed unexpectedly. Please file an issue on pip's issue "
-                "tracker: https://github.com/pypa/pip/issues/new"
-            )
-
-        if log_lines is None:
-            # No logs are available, they must have been printed earlier.
-            context = Text("See above for more details.")
-        else:
-            if isinstance(cause, PipError):
-                log_lines.append(f"ERROR: {cause}")
-            else:
-                # Split rendered error into real lines without trailing newlines.
-                log_lines.extend(
-                    "".join(traceback.format_exception(cause)).splitlines()
-                )
-
-            context = Text.assemble(
-                f"Installing {' '.join(build_reqs)}\n",
-                (f"[{len(log_lines)} lines of output]\n", "red"),
-                "\n".join(log_lines),
-                ("\n[end of output]", "red"),
-            )
-
-        message = Text("Cannot install build dependencies", "green")
-        if req:
-            message += Text(f" for {req}")
-        super().__init__(
-            message=message, context=context, hint_stmt=None, note_stmt=note
-        )
+_aborter: Aborter = Aborter()
